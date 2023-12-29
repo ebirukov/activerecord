@@ -40,28 +40,39 @@ func Box(ctx context.Context, shard int, instType activerecord.ShardInstanceType
 		return nil, fmt.Errorf("can't get cluster %s info: %w", configPath, err)
 	}
 
-	if len(clusterInfo) < shard {
-		return nil, fmt.Errorf("invalid shard num %d, max = %d", shard, len(clusterInfo))
+	if clusterInfo.Len() < shard {
+		return nil, fmt.Errorf("invalid shard num %d, max = %d", shard, clusterInfo.Len())
+	}
+
+	actualClusterInfo, err := activerecord.Ping(ctx, configPath, checkShardInstance)
+	if err != nil {
+		return nil, fmt.Errorf("cluster unavailable: %w", err)
+	}
+
+	if actualClusterInfo != nil {
+		clusterInfo = actualClusterInfo
 	}
 
 	var configBox activerecord.ShardInstance
 
 	switch instType {
 	case activerecord.ReplicaInstanceType:
-		if len(clusterInfo[shard].Replicas) == 0 {
+		if len(clusterInfo.OnlineReplicas(shard)) == 0 {
 			return nil, fmt.Errorf("replicas not set")
 		}
 
-		configBox = clusterInfo[shard].NextReplica()
+		configBox = clusterInfo.NextReplica(shard)
 	case activerecord.ReplicaOrMasterInstanceType:
-		if len(clusterInfo[shard].Replicas) != 0 {
-			configBox = clusterInfo[shard].NextReplica()
+		if len(clusterInfo.OnlineReplicas(shard)) != 0 {
+			configBox = clusterInfo.NextReplica(shard)
+			fmt.Println("replica ", configBox.Config.Addr, configBox.Offline)
 			break
 		}
 
 		fallthrough
 	case activerecord.MasterInstanceType:
-		configBox = clusterInfo[shard].NextMaster()
+		configBox = clusterInfo.NextMaster(shard)
+		fmt.Println("master ", configBox.Config.Addr, configBox.Offline)
 	}
 
 	conn, err := activerecord.ConnectionCacher().GetOrAdd(configBox, func(options interface{}) (activerecord.ConnectionInterface, error) {
@@ -82,6 +93,42 @@ func Box(ctx context.Context, shard int, instType activerecord.ShardInstanceType
 	}
 
 	return box, nil
+}
+
+func checkShardInstance(ctx context.Context, instance activerecord.ShardInstance) (activerecord.ServerModeType, error) {
+	conn, err := activerecord.ConnectionCacher().GetOrAdd(instance, func(options interface{}) (activerecord.ConnectionInterface, error) {
+		octopusOpt, ok := options.(*ConnectionOptions)
+		if !ok {
+			return nil, fmt.Errorf("invalit type of options %T, want Options", options)
+		}
+
+		return GetConnection(ctx, octopusOpt)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("error from connectionCacher: %w", err)
+	}
+
+	c, ok := conn.(*Connection)
+	if !ok {
+		return 0, fmt.Errorf("invalid connection type %T, want *octopus.Connection", conn)
+	}
+
+	td, err := CallLua(ctx, c, "box.dostring", "return box.info.status")
+	if err != nil {
+		return 0, fmt.Errorf("can't get status: %w", err)
+	}
+
+	if len(td) == 1 {
+		ret := td[0]
+		switch string(ret.Data[0]) {
+		case "primary":
+			return activerecord.ModeMaster, nil
+		default:
+			return activerecord.ModeReplica, nil
+		}
+	}
+
+	return 0, fmt.Errorf("can't parse status: %w", err)
 }
 
 func ProcessResp(respBytes []byte, cntFlag CountFlags) ([]TupleData, error) {

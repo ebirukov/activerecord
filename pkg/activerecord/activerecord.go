@@ -92,12 +92,12 @@ type ConnectionCacherInterface interface {
 }
 
 type PingerInterface interface {
-	SchedulePingIfNotExists(ctx context.Context, path string, instanceChecker func(ctx context.Context, instance ShardInstance) (ServerModeType, error)) (Cluster, error)
+	SchedulePingIfNotExists(ctx context.Context, path string, instanceChecker func(ctx context.Context, instance ShardInstance) (ServerModeType, error)) (*Cluster, error)
 }
 
 type ConfigCacherInterface interface {
-	Get(ctx context.Context, path string, glob MapGlobParam, optionCreator func(ShardInstanceConfig) (OptionInterface, error)) (Cluster, error)
-	Actualize(ctx context.Context, path string, instanceChecker func(ctx context.Context, instance ShardInstance) (ServerModeType, error)) (Cluster, error)
+	Get(ctx context.Context, path string, glob MapGlobParam, optionCreator func(ShardInstanceConfig) (OptionInterface, error)) (*Cluster, error)
+	Actualize(ctx context.Context, path string, instanceChecker func(ctx context.Context, instance ShardInstance) (ServerModeType, error)) (*Cluster, error)
 }
 
 type SerializerInterface interface {
@@ -200,7 +200,7 @@ func ConfigCacher() ConfigCacherInterface {
 	return GetInstance().configCacher
 }
 
-func Ping(ctx context.Context, path string, ping func(ctx context.Context, instance ShardInstance) (ServerModeType, error)) (Cluster, error) {
+func Ping(ctx context.Context, path string, ping func(ctx context.Context, instance ShardInstance) (ServerModeType, error)) (*Cluster, error) {
 	if instance == nil || instance.pinger == nil {
 		return nil, nil
 	}
