@@ -46,6 +46,11 @@ type ShardInstance struct {
 	ParamsID string
 	Config   ShardInstanceConfig
 	Options  interface{}
+	Offline  bool
+}
+
+func (s *ShardInstance) IsOffline() bool {
+	return s.Offline
 }
 
 // Структура описывающая конкретный шард. Каждый шард может состоять из набора мастеров и реплик
@@ -58,39 +63,54 @@ type Shard struct {
 
 // Функция выбирающая следующий инстанс мастера в конкретном шарде
 func (s *Shard) NextMaster() ShardInstance {
-	length := len(s.Masters)
+	masters := Online(s.Masters)
+	length := len(masters)
 	switch length {
 	case 0:
 		panic("no master configured")
 	case 1:
-		return s.Masters[0]
+		return masters[0]
 	}
 
 	newVal := atomic.AddInt32(&s.curMaster, 1)
-	newValMod := newVal % int32(len(s.Masters))
+	newValMod := newVal % int32(len(masters))
 
 	if newValMod != newVal {
 		atomic.CompareAndSwapInt32(&s.curMaster, newVal, newValMod)
 	}
 
-	return s.Masters[newValMod]
+	return masters[newValMod]
+}
+
+func Online(shards []ShardInstance) []ShardInstance {
+	ret := make([]ShardInstance, 0, len(shards))
+	for _, replica := range shards {
+		if replica.Offline {
+			continue
+		}
+
+		ret = append(ret, replica)
+	}
+
+	return ret
 }
 
 // Инстанс выбирающий конкретный инстанс реплики в конкретном шарде
 func (s *Shard) NextReplica() ShardInstance {
-	length := len(s.Replicas)
+	replicas := Online(s.Replicas)
+	length := len(replicas)
 	if length == 1 {
-		return s.Replicas[0]
+		return replicas[0]
 	}
 
 	newVal := atomic.AddInt32(&s.curReplica, 1)
-	newValMod := newVal % int32(len(s.Replicas))
+	newValMod := newVal % int32(len(replicas))
 
 	if newValMod != newVal {
 		atomic.CompareAndSwapInt32(&s.curReplica, newVal, newValMod)
 	}
 
-	return s.Replicas[newValMod]
+	return replicas[newValMod]
 }
 
 // Тип описывающий кластер. Сейчас кластер - это набор шардов.
@@ -173,6 +193,7 @@ func getShardInfoFromCfg(ctx context.Context, path string, globParam MapGlobPara
 	shardTimeout := cfg.GetDuration(ctx, path+"/Timeout", globParam.Timeout)
 	shardPoolSize := cfg.GetInt(ctx, path+"/PoolSize", globParam.PoolSize)
 
+	var instances []ShardInstance
 	// информация по местерам
 	master, exMaster := cfg.GetStringIfExists(ctx, path+"/master")
 	if !exMaster {
@@ -200,7 +221,7 @@ func getShardInfoFromCfg(ctx context.Context, path string, globParam MapGlobPara
 				return Shard{}, fmt.Errorf("can't create instanceOption: %w", err)
 			}
 
-			ret.Masters = append(ret.Masters, ShardInstance{
+			instances = append(instances, ShardInstance{
 				ParamsID: opt.GetConnectionID(),
 				Config:   shardCfg,
 				Options:  opt,
@@ -228,11 +249,20 @@ func getShardInfoFromCfg(ctx context.Context, path string, globParam MapGlobPara
 				return Shard{}, fmt.Errorf("can't create instanceOption: %w", err)
 			}
 
-			ret.Replicas = append(ret.Replicas, ShardInstance{
+			instances = append(instances, ShardInstance{
 				ParamsID: opt.GetConnectionID(),
 				Config:   shardCfg,
 				Options:  opt,
 			})
+		}
+	}
+
+	for _, shardInstance := range instances {
+		switch shardInstance.Config.Mode {
+		case ModeMaster:
+			ret.Masters = append(ret.Masters, shardInstance)
+		case ModeReplica:
+			ret.Replicas = append(ret.Replicas, shardInstance)
 		}
 	}
 
@@ -284,4 +314,87 @@ func (cc *DefaultConfigCacher) Get(ctx context.Context, path string, globs MapGl
 	}
 
 	return conf, nil
+}
+
+// Актуализирует конфигурацию кластера path, синхронизируя состояние конфигурации узлов кластера с серверной стороной (тип узла и его доступность)
+// Проверка типа и доступности узлов выполняется с помощью функции instanceChecker
+func (cc *DefaultConfigCacher) Actualize(ctx context.Context, path string, instanceChecker func(ctx context.Context, instance ShardInstance) (ServerModeType, error)) (Cluster, error) {
+	cc.lock.Lock()
+	defer cc.lock.Unlock()
+
+	clusterConfig, ex := cc.container[path]
+	if !ex || instanceChecker == nil {
+		return nil, nil
+	}
+
+	updatedConfig := make(Cluster, 0, len(clusterConfig))
+
+	for _, shard := range clusterConfig {
+		clusterShard := Shard{
+			Masters:  []ShardInstance{},
+			Replicas: []ShardInstance{},
+		}
+
+		var instances []ShardInstance
+
+		for _, master := range shard.Masters {
+			serverType, connErr := instanceChecker(ctx, master)
+
+			if connErr == nil {
+				master.Config.Mode = serverType
+			}
+
+			instances = append(instances, ShardInstance{
+				ParamsID: master.ParamsID,
+				Config:   master.Config,
+				Options:  master.Options,
+				Offline:  connErr != nil,
+			})
+		}
+
+		for _, replica := range shard.Replicas {
+			serverType, connErr := instanceChecker(ctx, replica)
+
+			if connErr == nil {
+				replica.Config.Mode = serverType
+			}
+
+			instances = append(instances, ShardInstance{
+				ParamsID: replica.ParamsID,
+				Config:   replica.Config,
+				Options:  replica.Options,
+				Offline:  connErr != nil,
+			})
+		}
+
+		for _, shardInstance := range instances {
+			switch shardInstance.Config.Mode {
+			case ModeMaster:
+				clusterShard.Masters = append(clusterShard.Masters, shardInstance)
+			case ModeReplica:
+				clusterShard.Replicas = append(clusterShard.Replicas, shardInstance)
+			}
+		}
+
+		updatedConfig = append(updatedConfig, clusterShard)
+	}
+
+	// TODO: Сравнить конфигуации перед обновлением
+	if len(updatedConfig) > 0 {
+		cc.container[path] = updatedConfig
+
+		return updatedConfig, nil
+	}
+
+	return clusterConfig, nil
+}
+
+func (cc *DefaultConfigCacher) Update(ctx context.Context, path string, clusterConf Cluster) (Cluster, error) {
+	if cc.updateTime.Sub(Config().GetLastUpdateTime()) < 0 {
+		return nil, fmt.Errorf("cluster config was modified since %s", cc.updateTime)
+	}
+
+	cc.container[path] = clusterConf
+
+	return clusterConf, nil
 }
